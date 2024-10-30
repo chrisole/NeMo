@@ -1962,7 +1962,13 @@ class CrossAttendModularAudioGPTModel(ModularAudioGPTModel):
                 if 'pre_decision_ratio' in kwargs:
                     pre_decision_ratio = kwargs['pre_decision_ratio']
                 else:
-                    pre_decision_ratio = self.cfg.streaming.get('pre_decision_ratio', 8)
+                    pre_decision_ratio_range = self.cfg.streaming.get('pre_decision_ratio_range', None)
+                    if pre_decision_ratio_range is not None:
+                        import random
+
+                        pre_decision_ratio = random.randint(pre_decision_ratio_range[0], pre_decision_ratio_range[1])
+                    else:
+                        pre_decision_ratio = self.cfg.streaming.get('pre_decision_ratio', 8)
             else:  # w/o waitk sampling, still train/eval w/ am xattn only in answer emb
                 waitk_lagging_max = 2  # temp
                 waitk_lagging_min = 1
