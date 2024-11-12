@@ -52,7 +52,11 @@ class AudioToTextGenerationStrategy(text_generation_strategy.GPTModelTextGenerat
             self.model.input_embeddings = input_embeddings
         self.model.tokens = tokens[:, :-1]  # remove eos
         self.model.token_length = self.model.tokens.shape[1]
-        assert self.model.input_embeddings.shape[1] == self.model.token_length
+
+        if self.model.input_embeddings.shape[1] != self.model.token_length:
+            raise ValueError(
+                f"input_embeddings length {self.model.input_embeddings.shape} does not match token_length {self.model.token_length}"
+            )
 
         # the following is the legacy end_of_generation_condition
         if len(end_strings) == 1 and end_strings[0] == END_OF_SEQ:

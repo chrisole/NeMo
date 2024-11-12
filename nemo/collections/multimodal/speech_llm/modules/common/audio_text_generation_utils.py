@@ -531,6 +531,98 @@ def generate(
     return None
 
 
+def generate_per_token(
+    model,
+    inputs: Union[Tuple, List[str]],
+    tokens_to_generate=0,
+    all_probs=False,
+    temperature=1.0,
+    add_BOS=False,
+    top_k=0,
+    top_p=0.0,
+    greedy=False,
+    compute_attention_mask=True,
+    compute_logprob=False,
+    repetition_penalty=1.0,
+    end_strings=['<|endoftext|>'],
+    min_tokens_to_generate=0,
+    **strategy_args,
+):
+    if 'strategy' in strategy_args:
+        inference_strategy = strategy_args['strategy']
+    else:
+        inference_strategy = model_inference_strategy_dispatcher(model)
+
+    tokenizer = model.tokenizer
+    has_multi_audios = False
+    num_audios = None
+    audio_locator_ids = None
+    context_start_idx = None
+    audio_signal, audio_signal_length = None, None
+    if isinstance(inputs, tuple) and len(inputs) == 2:
+        context_tokens_tensor, context_length_tensor = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 4:
+        context_tokens_tensor, context_length_tensor, audio_signal, audio_signal_length = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 5:  # multi-audio
+        has_multi_audios = True
+        (
+            context_tokens_tensor,
+            context_length_tensor,
+            audio_signal,
+            audio_signal_length,
+            audio_locator_ids,
+        ) = inputs
+    elif isinstance(inputs, tuple) and len(inputs) == 6:  # multi-audio
+        has_multi_audios = True
+        (
+            context_tokens_tensor,
+            context_length_tensor,
+            audio_signal,
+            audio_signal_length,
+            num_audios,
+            context_start_idx,
+        ) = inputs
+    else:
+        context_tokens_tensor, context_length_tensor = inference_strategy.tokenize_batch(
+            inputs, tokens_to_generate, add_BOS
+        )
+
+    context_length = context_length_tensor.min().item()
+    tokenizer = model.tokenizer
+    if isinstance(tokenizer, TabularTokenizer):
+        raise NotImplementedError("Tabular generation is not supported yet")
+    else:
+        batch_token_iterator = sample_sequence_batch(
+            model,
+            inference_strategy,
+            context_tokens_tensor,
+            context_length_tensor,
+            audio_signal,
+            audio_signal_length,
+            tokens_to_generate,
+            all_probs,
+            compute_attention_mask=compute_attention_mask,
+            compute_logprob=compute_logprob,
+            temperature=temperature,
+            end_strings=end_strings,
+            extra={
+                "top_p": top_p,
+                "top_k": top_k,
+                "greedy": greedy,
+                "repetition_penalty": repetition_penalty,
+                "min_tokens_to_generate": min_tokens_to_generate,
+            },
+            num_audios=num_audios,
+            context_start_idx=context_start_idx,
+            audio_locator_ids=audio_locator_ids,
+            **strategy_args,
+        )
+
+    for tokens, lengths, output_logits, full_logits, audio_feat_lens in batch_token_iterator:
+        context_length += 1
+        yield tokens[:, context_length + audio_feat_lens.min().item() - 1]
+
+
 def switch(val1, val2, boolean):
     boolean = boolean.type_as(val1)
     return (1 - boolean) * val1 + boolean * val2
