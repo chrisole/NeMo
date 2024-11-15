@@ -596,6 +596,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 None, None, encoder_input, attention_mask, labels, checkpoint_activations_all_layers
             )
             multimodal_output['multimodal_conversation'] = (output, loss_mask)
+        self.log('label_len', labels.shape[1], rank_zero_only=True, batch_size=1, sync_dist=True)
         if not audio_batch and not text_batch and not conv_batch:
             raise ValueError("No input data found for the model.")
 
