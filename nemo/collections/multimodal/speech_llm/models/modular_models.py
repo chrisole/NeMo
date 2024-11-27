@@ -905,8 +905,11 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
         with open_dict(gpt_cfg):
             use_multi_encoder = gpt_cfg.perception.get("encoders", None) is not None
             if not use_multi_encoder:
+                encoder = gpt_cfg.perception.get("encoder", {})
                 gpt_cfg.perception.preprocessor = audio_cfg.preprocessor
                 gpt_cfg.perception.encoder = audio_cfg.encoder
+                for k, v in encoder.items():
+                    gpt_cfg.perception.encoder[k] = v
             else:
                 for key in gpt_cfg.perception.encoders:
                     model_key = gpt_cfg.perception.encoders[key].get("model_key", "encoder")
