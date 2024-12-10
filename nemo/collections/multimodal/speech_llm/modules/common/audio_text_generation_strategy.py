@@ -300,7 +300,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             logging.debug(f"speech done text {text_done_token}")
         duplex_method = self.model.cfg.get("duplex_method", None)
         if (
-            duplex_method == 'from_duplex'
+            duplex_method == 'from_duplex' or duplex_method == 'from_stt'
         ):  # in this case, the audio generation should always continue until the max_steps or the end of user channel
             speech_done_token = torch.zeros_like(speech_done_token)
         return speech_done_token
@@ -333,7 +333,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             duplex_method = self.model.cfg.get("duplex_method", None)
             if duplex_method is None:
                 pass
-            elif duplex_method == "from_multiturn" or duplex_method == "from_duplex":
+            elif duplex_method == "from_multiturn" or duplex_method == "from_duplex" or duplex_method == 'from_stt':
                 encoded = self.encoded[:, curr_context_length - 1].view(micro_batch_size, 1, -1)
                 embeddings2use = embeddings2use + encoded.transpose(0, 1).contiguous()
             else:
@@ -390,10 +390,20 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             }
             # pad user signal with silence of the length of answer_audio_lens and store the encoded for prepare_batch_at_step
             # in real setting, encoded has to be recomputed every time if using bidirectional encoder or incrementally computed
+        elif duplex_method == 'from_stt':
+            batch = {
+                'audio_signal': audio_signal,
+                'audio_signal_length': audio_length,
+                'context_lengths': context_lengths,
+                'labels': context_tokens,
+                'answer_audio_lens': torch.full([audio_signal.shape[0]], answer_audio_lens).cuda(),
+                'answer_audio': torch.zeros([audio_signal.shape[0], answer_audio_lens]).cuda(),
+                'loss_mask': None,
+            }
         else:
             raise ValueError(f"duplex_method {duplex_method} not supported")
 
-        encoder_input, _, labels, _, (self.encoded, _) = self.model.prepare_llm_input_duplex_from_multiturn(batch)
+        encoder_input, _, labels, _, (self.encoded, _) = self.model.prepare_llm_input(batch)
         self.attention_mask = self.model._create_attention_mask(encoder_input.transpose(0, 1))
         self.position_ids = build_position_ids(encoder_input.transpose(0, 1)[:, :, 0])
         return labels, encoder_input, -context_lengths + 1
@@ -414,7 +424,7 @@ class AudioToAudioGenerationStrategy(AudioToTextGenerationStrategy):
             return super().init_batch(
                 context_tokens, context_lengths, audio_signal, audio_length, compute_attention_mask, num_audios
             )
-        elif duplex_method == "from_multiturn" or duplex_method == "from_duplex":
+        elif duplex_method == "from_multiturn" or duplex_method == "from_duplex" or duplex_method == 'from_stt':
             return self.init_batch_duplex_from_multiturn(context_tokens, context_lengths, audio_signal, audio_length)
         else:
             raise ValueError(f"duplex_method {duplex_method} not supported")

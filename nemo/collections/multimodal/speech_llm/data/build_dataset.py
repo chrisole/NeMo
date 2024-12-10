@@ -82,7 +82,7 @@ def build_speechllm_dataset(model_instance, data_cfg, is_train):
         )
         dataloader_cls = (
             S2SLhotseAudioQuestionAnswerDataset
-            if hasattr(data_cfg, 'speech_bos_id')
+            if hasattr(data_cfg, 'load_answer_audio')
             else LhotseAudioQuestionAnswerDataset
         )
         return dataloader_cls(
