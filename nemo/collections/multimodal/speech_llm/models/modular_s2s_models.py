@@ -385,11 +385,14 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
         output = self.predict_step(batch, batch_idx, dataloader_idx)
 
-        inputs_text = (
-            [self.tokenizer.ids_to_text(c.tolist()) for c in batch['instructions']]
-            if batch['instructions'] is not None
-            else [""] * len(batch['target_texts'])
-        )
+        if 'instructions' in batch and batch['instructions'] is not None:
+            inputs_text = [self.tokenizer.ids_to_text(c.tolist()) for c in batch['instructions']]
+        elif 'target_texts' in batch:
+            inputs_text = [""] * len(batch['target_texts'])
+        else:
+            inputs_text = batch['contexts']
+        if 'target_texts' not in batch:
+            batch['target_texts'] = batch['answers']
         labels_text = [self.tokenizer.ids_to_text(a.tolist()) for a in batch['target_texts']]
         # only do ids_to_text on the first channel which is text
         output['token_ids_text'] = (np.array(output['token_ids'])[:, :, 0]).tolist()
@@ -1028,8 +1031,8 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 self.perception.cfg.preprocessor.sample_rate,
                 codec_sample_rate,
             )
-        agent_signal = user_signal[:]
-        agent_signal_length = user_signal_length[:]
+        agent_signal = audio_batch.get('answer_audio', user_signal[:])
+        agent_signal_length = audio_batch.get('answer_audio_lens', user_signal_length[:])
 
         new_user_signal = []
         new_agent_signal = []
@@ -1092,7 +1095,6 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
         )  # bos
         shift_text_channel_len = answer_codecs_lens - prev_answer_features_lens - 2  # 2 is for bos and eos
 
-        new_loss_mask = []
         all_channels = []
         for i, answer_codec in enumerate(answer_codecs):
             # this branch is not used anymore
@@ -1105,19 +1107,16 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
                 [
                     torch.full([shift_text_channel_len[i], 1], pad_id).cuda(),
                     torch.full([1, 1], self.tokenizer.bos_id).cuda(),
-                    labels[i, base_length:, :1],
+                    labels[i, base_length:].unsqueeze(-1),
                 ],
                 dim=0,
             )
             sliced_text_channel = text_channel[: answer_codec.shape[0]]
+            sliced_text_channel = torch.nn.functional.pad(
+                sliced_text_channel, (0, 0, 0, answer_codec.shape[0] - sliced_text_channel.shape[0]), value=0
+            )
             # checked text_channel, loss_mask;  checked injecting bos and eos properly to control turn taking in inference
             all_channels.append(torch.cat([sliced_text_channel, answer_codec], dim=-1))
-            if loss_mask is not None:
-                cur_loss_mask = torch.cat(
-                    [torch.zeros([shift_text_channel_len[i], loss_mask.shape[-1]]).cuda(), loss_mask[i, base_length:]],
-                    dim=0,
-                )
-                new_loss_mask.append(cur_loss_mask[: answer_codec.shape[0]])
         all_channels = pad_sequence(all_channels, batch_first=True)
         input_ids = all_channels[:, :-1]
         encoded = encoded[:, : input_ids.shape[1]]
@@ -1484,3 +1483,13 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
 
         squim_mos_model = SQUIM_SUBJECTIVE.get_model()
         return squim_mos_model
+
+    def setup_optimizer_param_groups(self):
+        super().setup_optimizer_param_groups()
+        freeze_llm = self.cfg.get('freeze_llm', True)
+        if freeze_llm:
+            # needs to be updated since vocab is changed
+            for param in self.model.embedding.parameters():
+                param.requires_grad = True
+            for param in self.model.output_layers.parameters():
+                param.requires_grad = True
