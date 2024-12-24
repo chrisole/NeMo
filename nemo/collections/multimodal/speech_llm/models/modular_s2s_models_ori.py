@@ -20,7 +20,7 @@ from pytorch_lightning.utilities import rank_zero_only
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 from torchaudio.pipelines import SQUIM_SUBJECTIVE
-from nemo.collections.multimodal.speech_llm.modules.streaming_transformer import StreamingTransformer
+
 from nemo.collections.asr.parts.utils.eval_utils import remove_punctuations
 from nemo.collections.common.metrics import MetricStringToTorchMetric, TextMetricsSet
 from nemo.collections.common.parts.utils import apply_rope_scaling, extend_instance
@@ -57,21 +57,6 @@ except (ImportError, ModuleNotFoundError):
     HAVE_MEGATRON_CORE = False
 
 default_inference_config = {'tokens_to_generate': 30}
-
-
-def sample_token(
-    logits: torch.Tensor,
-    use_sampling: bool = False,
-    temp: float = 1.0,
-) -> torch.Tensor:
-
-    if use_sampling and temp > 0.0:
-        probs = torch.softmax(logits / temp, dim=-1)
-        next_token = multinomial(probs, num_samples=1)
-    else:
-        next_token = torch.argmax(logits, dim=-1, keepdim=True)
-    assert next_token.shape[-1] == 1
-    return next_token[..., 0]
 
 
 class SumVocabParallelEmbedding(tensor_parallel.VocabParallelEmbedding):
@@ -136,39 +121,24 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         self.n_proj_heads = len(proj_head_dims)
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
-
-
-        self.depformer_dim = 512
-
-
-        # One linear layer per codebook to project different informations from the main model.
-        self.depformer_in = torch.nn.ModuleList(
-            [torch.nn.Linear(config.hidden_size, self.depformer_dim, bias=False) for _ in range(self.n_proj_heads - 1)]
+        self.output_layers = torch.nn.ModuleList(
+            [
+                tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    output_size=self.proj_head_dims[i],
+                    config=config,
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,  # if skip_weight_param_allocation=True, weights are initialized from setup_embeddings_and_output_layer
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    grad_output_buffer=self.grad_output_buffer,
+                )
+                for i in range(self.n_proj_heads)
+            ]
         )
-        # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
-        self.depformer_emb = torch.nn.ModuleList(
-            [torch.nn.Embedding(self.proj_head_dims[i+1], self.depformer_dim) for i in range(self.n_proj_heads - 2)]
-        )
-
-        self.depformer_text_emb = torch.nn.Embedding(self.proj_head_dims[0], self.depformer_dim)
-
-
-        self.depformer = StreamingTransformer(
-            d_model=self.depformer_dim,
-            dim_feedforward=int(self.depformer_dim * 4),
-            norm="layer_norm",
-            num_heads=8,
-            num_layers=16
-            # device=self.device,
-        )
-
-        self.depformer.set_streaming_propagate(False)
-
-
-        self.linears = torch.nn.ModuleList(
-            [torch.nn.Linear(self.depformer_dim, self.proj_head_dims[1], bias=False) for _ in range(self.n_proj_heads - 1)]
-        )
-
 
     # TODO rewrite setup_embeddings_and_output_layer to include self.output_layers
 
@@ -194,8 +164,6 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
-
-
     def forward(
         self,
         input_ids: Tensor,
@@ -216,8 +184,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        # Decoder embedding
-
+        # Decoder embedding.
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -244,96 +211,43 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             packed_seq_params=packed_seq_params,
             **(extra_block_kwargs or {}),
         )
+
         if not self.post_process:
             return hidden_states
 
+        # logits and loss
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
         else:
             output_weight = None
-        # Here the text logits is calculated separately
-        text_logits, _ = self.output_layer(
+        all_logits = []
+        cur_dims = 0
+        for i in range(self.n_proj_heads):
+            cur_output_weight = (
+                output_weight[cur_dims : cur_dims + self.proj_head_dims[i]] if output_weight is not None else None
+            )
+            all_logits.append(self.output_layers[i](hidden_states, weight=cur_output_weight)[0])
+            cur_dims += self.proj_head_dims[i]
+        assert self.vocab_size == self.proj_head_dims[0]
+        all_logits[0], _ = self.output_layer(
             hidden_states, weight=output_weight[: self.vocab_size] if output_weight is not None else None
         )
 
+        if labels is None:
+            # [s b h] => [b s h]
+            return_logits = [logits.transpose(0, 1).contiguous() for logits in all_logits]
+            return torch.cat(return_logits, dim=-1)  # cat the last dim together to make other mcore code happy
 
-
-        if labels is not None:
-
-            # Training Mode:
-            # reshape the hidden_state: [B, T, D] -> [B*T, 1, D]
-            depformer_hidden_states = hidden_states.reshape(-1, 1, self.config.hidden_size)
-            # Format depfomer input with teacher-forcing: depformer_input = [B * T, 8, 1], 8 is remove the last audio channel.
-            depformer_input = labels[:, :, : self.n_proj_heads -1].reshape(-1, self.n_proj_heads -1, 1)
-
-            # depformer_input_layers downsample the hidden_states to depformer dim
-            depformer_input_layers = torch.nn.ModuleList([self.depformer_in[cb_index] for cb_index in range(self.n_proj_heads -1)])
-            # [B*T, 1, D] ==> [B*T, 1, D_dep]
-            depformer_hidden_states = torch.stack([in_layer(depformer_hidden_states) for in_layer in depformer_input_layers], dim=1).squeeze(2)
-
-            # depformer_emb_layer is to process the input from label
-            depformer_emb_layers = torch.nn.ModuleList(
-                [self.depformer_text_emb] + [self.depformer_emb[cb_index] for cb_index in range(self.n_proj_heads -2)])
-
-            last_token_input = torch.stack([emb_layer(depformer_input[:, i]) for i, emb_layer in enumerate(depformer_emb_layers)],
-                                           dim=1).squeeze(2)
-
-            depformer_linear_layers = torch.nn.ModuleList([self.linears[cb_index] for cb_index in range(self.n_proj_heads -1)])
-
-            depformer_hidden_states = depformer_hidden_states + last_token_input
-
-            depformer_output = self.depformer(depformer_hidden_states)
-
-            all_logits = [text_logits] # [T, B, V]
-            for i, audio_linear_layer in enumerate(depformer_linear_layers):
-                all_logits.append(audio_linear_layer(depformer_output[:, i, :]).reshape(text_logits.shape[0], text_logits.shape[1], -1))
-            tokens_loss = torch.stack(
-                [self.compute_language_model_loss(labels[:, :, i], all_logits[i]) for i in range(self.n_proj_heads)],
-                axis=2,
-            )
-            tokens_loss = (
-                tokens_loss
-                * torch.FloatTensor(self.proj_head_loss_weights).to(tokens_loss.device)
-                / sum(self.proj_head_loss_weights)
-            )
-            return tokens_loss
-
-        else:
-
-            # We need first get text token to compute audio logits.
-            # TODO: Here simple greedy strategy is used, which is different with real decoding strategy
-            text_token = sample_token(text_logits) # [1, B]
-
-            hidden_states = hidden_states.reshape(-1, 1, self.config.hidden_size)# [T*B, D]
-
-            # with self.depformer.streaming(S):
-            all_logits = [text_logits.transpose(0, 1)] #[1, B, V] --> [B, 1, V]
-
-            for cb_index in range(self.n_proj_heads -1):
-
-                depformer_hidden_states = self.depformer_in[cb_index](hidden_states) # [B, 1, D_dep]
-
-                if cb_index == 0:
-                    last_token_input = self.depformer_text_emb(text_token.transpose(0,1))  # [B, 1, D_dep]
-                else:
-                    last_token_input = self.depformer_emb[cb_index - 1](
-                        text_token
-                    )
-
-                depformer_hidden_states = depformer_hidden_states + last_token_input
-
-                depformer_output = self.depformer(depformer_hidden_states)  # [B, 1, depformer_dim]
-
-                logits = self.linears[cb_index](depformer_output) # [B, 1, V_dep]
-                all_logits.append(logits)
-
-                next_token = sample_token(logits)
-
-                # now the new generated audio_tokne becomes new text_token
-                text_token = next_token
-            return torch.cat(all_logits, dim=-1)
-            #return torch.empty(text_logits.shape[1],text_logits.shape[0], 64296).uniform_(-0.1, 0.1).to(text_logits.device)
-
+        tokens_loss = torch.stack(
+            [self.compute_language_model_loss(labels[:, :, i], all_logits[i]) for i in range(self.n_proj_heads)],
+            axis=2,
+        )
+        tokens_loss = (
+            tokens_loss
+            * torch.FloatTensor(self.proj_head_loss_weights).to(tokens_loss.device)
+            / sum(self.proj_head_loss_weights)
+        )
+        return tokens_loss
 
 
 class S2sModularAudioGPTModel(ModularAudioGPTModel):
@@ -879,7 +793,7 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             turn_taking_er = sum(deduplicated_outputs['turn_taking_error']) / len(deduplicated_outputs['turn_taking_error']) if deduplicated_outputs['turn_taking_error'] else torch.inf
 
 
-            logging.info(f'The success rate of turn taking is: {turn_taking_sr}')
+            logging.info(f'The success rate of turn taking is: {turn_taking_sr}%')
             logging.info(f'The average turn taking latency is: {turn_taking_er}')
             # Compute metric score
             for metric_name, metric_fn, averaged_metric in zip(metric_name, metric, averaged_metric):
@@ -1517,5 +1431,5 @@ class S2sModularAudioGPTModel(ModularAudioGPTModel):
             # needs to be updated since vocab is changed
             for param in self.model.embedding.parameters():
                 param.requires_grad = True
-            for param in self.model.output_layer.parameters():
+            for param in self.model.output_layers.parameters():
                 param.requires_grad = True

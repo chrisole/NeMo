@@ -567,6 +567,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
     def get_forward_output_only_func(self):
         def fwd_output_only_func(dataloader_iter, model):
             batch = next(dataloader_iter)
+
             extra_arg = {}
             # take the batch produced by prepare_batch_at_step
             (
@@ -604,6 +605,7 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
 
             if self.megatron_amp_O2:
                 input_embeddings = input_embeddings.type(self.model.module.embedding.word_embeddings.weight.dtype)
+
             output_tensor = model(
                 input_ids=None,
                 position_ids=None,
