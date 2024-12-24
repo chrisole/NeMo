@@ -137,22 +137,8 @@ class S2sMCoreGPTModel(MCoreGPTModel):
         self.proj_head_dims = proj_head_dims
         self.proj_head_loss_weights = proj_head_loss_weights
 
-
+        # (512,8,16) make the depformer para. to be 105M
         self.depformer_dim = 512
-
-
-        # One linear layer per codebook to project different informations from the main model.
-        self.depformer_in = torch.nn.ModuleList(
-            [torch.nn.Linear(config.hidden_size, self.depformer_dim, bias=False) for _ in range(self.n_proj_heads - 1)]
-        )
-        # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
-        self.depformer_emb = torch.nn.ModuleList(
-            [torch.nn.Embedding(self.proj_head_dims[i+1], self.depformer_dim) for i in range(self.n_proj_heads - 2)]
-        )
-
-        self.depformer_text_emb = torch.nn.Embedding(self.proj_head_dims[0], self.depformer_dim)
-
-
         self.depformer = StreamingTransformer(
             d_model=self.depformer_dim,
             dim_feedforward=int(self.depformer_dim * 4),
@@ -162,15 +148,22 @@ class S2sMCoreGPTModel(MCoreGPTModel):
             # device=self.device,
         )
 
+        # One linear layer per codebook to project different informations from the main model.
+        self.depformer_in = torch.nn.ModuleList(
+            [torch.nn.Linear(config.hidden_size, self.depformer_dim, bias=False) for _ in range(self.n_proj_heads - 1)]
+        )
+        # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
+        self.depformer_emb = torch.nn.ModuleList(
+            [torch.nn.Embedding(self.proj_head_dims[i+1], self.depformer_dim) for i in range(self.n_proj_heads - 2)]
+        )
+        self.depformer_text_emb = torch.nn.Embedding(self.proj_head_dims[0], self.depformer_dim)
+
         self.depformer.set_streaming_propagate(False)
 
-
+        # This liner is map the depformer output to audio voca.
         self.linears = torch.nn.ModuleList(
             [torch.nn.Linear(self.depformer_dim, self.proj_head_dims[1], bias=False) for _ in range(self.n_proj_heads - 1)]
         )
-
-
-    # TODO rewrite setup_embeddings_and_output_layer to include self.output_layers
 
     def extend_embedding(self, vocab_size: int):
         """Extend the embedding layer with new vocab size."""
@@ -311,7 +304,7 @@ class S2sMCoreGPTModel(MCoreGPTModel):
 
             for cb_index in range(self.n_proj_heads -1):
 
-                depformer_hidden_states = self.depformer_in[cb_index](hidden_states) # [B, 1, D_dep]
+                depformer_hidden_states = self.depformer_in[cb_index](hidden_states) # [B, 1, D_dep], not sure why second dim always be 1.
 
                 if cb_index == 0:
                     last_token_input = self.depformer_text_emb(text_token.transpose(0,1))  # [B, 1, D_dep]
